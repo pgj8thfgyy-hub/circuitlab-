@@ -1,0 +1,449 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<title>CircuitLab 3D v2</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:#050510;color:#e6eef8;font-family:system-ui;overflow:hidden}
+  #tb{position:fixed;top:12px;left:12px;display:flex;gap:6px;background:rgba(5,10,25,.9);
+      padding:8px;border-radius:10px;border:1px solid #1e2e4a;z-index:10}
+  #tb button{background:#132238;border:1px solid #2a3a5a;color:#cfe3ff;
+      padding:6px 12px;border-radius:6px;cursor:pointer;font-size:12px}
+  #tb button:hover{background:#1c2f4a}
+  #ed{position:fixed;top:12px;right:12px;width:280px;background:rgba(5,10,25,.93);
+      padding:14px;border-radius:10px;border:1px solid #1e2e4a;z-index:10;
+      max-height:calc(100vh - 260px);overflow-y:auto;backdrop-filter:blur(10px)}
+  #ed h3{margin-bottom:10px;color:#7fc4ff;font-size:13px;letter-spacing:1px}
+  .row{display:flex;justify-content:space-between;align-items:center;
+      padding:7px 6px;border-bottom:1px solid #15233a;cursor:pointer;font-size:12px;
+      border-radius:4px;transition:background .15s}
+  .row:hover{background:rgba(42,107,255,.15)}
+  .row.sel{background:rgba(42,107,255,.3)}
+  .row small{color:#7a8ea8}
+  #scope{position:fixed;bottom:12px;right:12px;background:rgba(5,10,25,.93);
+      border-radius:10px;border:1px solid #1e2e4a;z-index:10;backdrop-filter:blur(10px)}
+  #st{position:fixed;bottom:12px;left:12px;background:rgba(5,10,25,.88);
+      padding:8px 12px;border-radius:8px;border:1px solid #1e2e4a;font-size:11px;
+      color:#7a8ea8;z-index:10;font-family:monospace;line-height:1.6}
+  .param{margin:8px 0}
+  .param label{display:block;color:#8aa8c8;font-size:11px;margin-bottom:3px}
+  input[type=range]{width:100%;accent-color:#2a6bff}
+  .v{color:#ffdd44;font-family:monospace}
+</style>
+</head>
+<body>
+<div id="tb">
+  <button id="bPlay">⏸ Pause</button>
+  <button id="bReset">⟲ Reset</button>
+  <button id="bSave">💾 Save</button>
+  <button id="bLoad">📂 Load</button>
+</div>
+<div id="ed"><h3>▸ COMPOSANTS</h3><div id="list"></div><div id="edit"></div></div>
+<canvas id="scope" width="460" height="220"></canvas>
+<div id="st"></div>
+
+<script type="importmap">
+{"imports":{
+  "three":"https://unpkg.com/three@0.160.0/build/three.module.js",
+  "three/addons/":"https://unpkg.com/three@0.160.0/examples/jsm/"
+}}
+</script>
+<script type="module">
+import * as THREE from 'three';
+import {OrbitControls} from 'three/addons/controls/OrbitControls.js';
+
+/* ════════════ GAUSS ════════════ */
+function gauss(A, b, N){
+  const M=A.map(r=>Float64Array.from(r)), r=Float64Array.from(b);
+  for(let c=0;c<N;c++){
+    let p=c; for(let i=c+1;i<N;i++) if(Math.abs(M[i][c])>Math.abs(M[p][c])) p=i;
+    if(p!==c){[M[p],M[c]]=[M[c],M[p]];[r[p],r[c]]=[r[c],r[p]];}
+    const piv=M[c][c]; if(Math.abs(piv)<1e-20) continue;
+    for(let i=c+1;i<N;i++){const f=M[i][c]/piv; if(!f) continue;
+      for(let k=c;k<N;k++) M[i][k]-=f*M[c][k]; r[i]-=f*r[c];}
+  }
+  const x=new Float64Array(N);
+  for(let i=N-1;i>=0;i--){let s=r[i]; for(let j=i+1;j<N;j++) s-=M[i][j]*x[j];
+    x[i]=Math.abs(M[i][i])>1e-20?s/M[i][i]:0;}
+  return x;
+}
+
+/* ════════════ CIRCUIT ════════════ */
+class Circuit{
+  constructor(){
+    this.nN=0; this.comps=[]; this.t=0;
+    this.dt=1e-5; this.dtMin=1e-7; this.dtMax=2e-3;
+  }
+  node(){return ++this.nN;}
+  add(c){this.comps.push(c); return c;}
+  R(a,b,v){return this.add({type:'R',a,b,val:v,name:'R'});}
+  C(a,b,v){return this.add({type:'C',a,b,val:v,vP:0,iP:0,name:'C'});}
+  L(a,b,v){return this.add({type:'L',a,b,val:v,vP:0,iP:0,name:'L'});}
+  V(a,b,v){return this.add({type:'V',a,b,val:v,func:null,name:'V'});}
+  Vsin(a,b,amp,f){return this.add({type:'V',a,b,val:0,func:t=>amp*Math.sin(2*Math.PI*f*t),name:'V∿',amp,f});}
+  I(a,b,v){return this.add({type:'I',a,b,val:v,name:'I'});}
+  D(a,b){return this.add({type:'D',a,b,vP:0.6,Is:1e-12,n:1.8,Vt:0.026,name:'D'});}
+
+  reset(){this.t=0;
+    for(const c of this.comps){
+      if(c.type==='C'||c.type==='L'){c.vP=0;c.iP=0;}
+      if(c.type==='D') c.vP=0.6;
+    }}
+
+  step(){
+    const dt=this.dt, tr=true, n=this.nN;
+    const srcs=this.comps.filter(c=>c.type==='V'||c.type==='L');
+    srcs.forEach((c,i)=>c.branch=i);
+    const N=n+srcs.length;
+    const diodes=this.comps.filter(c=>c.type==='D');
+
+    // valeur instantanée des sources
+    for(const c of this.comps) if(c.type==='V'&&c.func) c.val=c.func(this.t+dt);
+
+    let sol=null, maxErr=0;
+    for(let iter=0; iter<25; iter++){
+      const A=Array.from({length:N},()=>new Float64Array(N));
+      const z=new Float64Array(N);
+      const G=(a,b,g)=>{if(a>0)A[a-1][a-1]+=g;if(b>0)A[b-1][b-1]+=g;
+                        if(a>0&&b>0){A[a-1][b-1]-=g;A[b-1][a-1]-=g;}};
+      const Ii=(a,b,i)=>{if(a>0)z[a-1]+=i;if(b>0)z[b-1]-=i;};
+
+      for(const c of this.comps){
+        if(c.type==='R'){G(c.a,c.b,1/c.val);}
+        else if(c.type==='C'){
+          const Geq=2*c.val/dt, Ieq=-Geq*c.vP-c.iP;
+          G(c.a,c.b,Geq); Ii(c.a,c.b,-Ieq);  // z[a]-=Ieq
+        }
+        else if(c.type==='V'){
+          const bi=n+c.branch;
+          if(c.a>0){A[c.a-1][bi]+=1; A[bi][c.a-1]+=1;}
+          if(c.b>0){A[c.b-1][bi]-=1; A[bi][c.b-1]-=1;}
+          z[bi]=c.val;
+        }
+        else if(c.type==='I'){Ii(c.a,c.b,c.val);}
+        else if(c.type==='L'){
+          const bi=n+c.branch, Req=2*c.val/dt;
+          if(c.a>0){A[c.a-1][bi]+=1; A[bi][c.a-1]+=1;}
+          if(c.b>0){A[c.b-1][bi]-=1; A[bi][c.b-1]-=1;}
+          A[bi][bi]-=Req;
+          z[bi]=-Req*c.iP-c.vP;
+        }
+        else if(c.type==='D'){
+          const vt=c.n*c.Vt;
+          const vd=(iter===0)?c.vP:(sol?sol[c.a-1]-(c.b>0?sol[c.b-1]:0):c.vP);
+          const ex=Math.exp(Math.min(vd/vt,40));
+          const Id=c.Is*(ex-1);
+          let Geq=(c.Is/vt)*ex; if(Geq<1e-12) Geq=1e-12;
+          const Ieq=Id-Geq*vd;
+          G(c.a,c.b,Geq); Ii(c.a,c.b,-Ieq);  // z[a]-=Ieq
+        }
+      }
+      sol=gauss(A,z,N);
+      // check diode convergence
+      maxErr=0;
+      for(const d of diodes){
+        const vdNew=sol[d.a-1]-(d.b>0?sol[d.b-1]:0);
+        const err=Math.abs(vdNew-d.vP);
+        if(err>maxErr) maxErr=err;
+        d.vP=vdNew;
+      }
+      if(maxErr<1e-5) break;
+    }
+
+    const V=new Float64Array(n+1);
+    for(let i=1;i<=n;i++) V[i]=sol[i-1];
+    const cur=new Map();
+    for(const c of this.comps){
+      let I=0;
+      if(c.type==='R') I=(V[c.a]-V[c.b])/c.val;
+      else if(c.type==='V'||c.type==='L') I=sol[n+c.branch];
+      else if(c.type==='I') I=c.val;
+      else if(c.type==='D') I=c.Is*(Math.exp(Math.min((V[c.a]-V[c.b])/(c.n*c.Vt),40))-1);
+      else if(c.type==='C'){
+        const Geq=2*c.val/dt;
+        I=Geq*((V[c.a]-V[c.b])-c.vP)-c.iP;
+      }
+      c.current=I; cur.set(c,I);
+    }
+    // update state
+    for(const c of this.comps){
+      if(c.type==='C'){
+        const vNew=V[c.a]-V[c.b], Geq=2*c.val/dt;
+        c.iP=Geq*(vNew-c.vP)-c.iP; c.vP=vNew;
+      }
+      if(c.type==='L'){
+        const iNew=cur.get(c), Req=2*c.val/dt;
+        c.vP=Req*(iNew-c.iP)-c.vP; c.iP=iNew;
+      }
+    }
+    this.t+=dt;
+
+    // ─── adaptive timestep ───
+    if(this._prevV){
+      let maxDv=0;
+      for(let i=1;i<=n;i++) maxDv=Math.max(maxDv,Math.abs(V[i]-this._prevV[i]));
+      if(maxDv>0.4) this.dt=Math.max(this.dtMin,dt/2);
+      else if(maxDv<0.04) this.dt=Math.min(this.dtMax,dt*1.5);
+    }
+    this._prevV=V;
+    return {V,cur};
+  }
+}
+
+/* ════════════ CIRCUIT PAR DÉFAUT ════════════
+   Détecteur de crête : V∿ → R → D → (C ∥ R_load)
+   ────────────────────────────────────────── */
+const circuit=new Circuit();
+const n1=circuit.node(), n2=circuit.node(), n3=circuit.node();
+circuit.Vsin(n1,0,6,100);      // 6V crête, 100 Hz
+circuit.R(n1,n2,8);
+circuit.D(n2,n3);
+circuit.C(n3,0,220e-6);
+circuit.R(n3,0,120);
+
+const positions={
+  0:new THREE.Vector3(0,0,0),
+  1:new THREE.Vector3(0,4,0),
+  2:new THREE.Vector3(3,4,0),
+  3:new THREE.Vector3(6,2,0),
+};
+
+/* ════════════ SCENE ════════════ */
+const scene=new THREE.Scene();
+scene.background=new THREE.Color(0x050510);
+scene.fog=new THREE.FogExp2(0x050510,0.02);
+
+const cam=new THREE.PerspectiveCamera(55,innerWidth/innerHeight,0.1,500);
+cam.position.set(10,8,14);
+
+const rnd=new THREE.WebGLRenderer({antialias:true});
+rnd.setPixelRatio(Math.min(devicePixelRatio,2));
+rnd.setSize(innerWidth,innerHeight);
+document.body.appendChild(rnd.domElement);
+
+const ctrl=new OrbitControls(cam,rnd.domElement);
+ctrl.enableDamping=true; ctrl.target.set(3,2,0);
+
+scene.add(new THREE.AmbientLight(0xffffff,0.45));
+const dl=new THREE.DirectionalLight(0xffffff,1); dl.position.set(6,12,8); scene.add(dl);
+const pl=new THREE.PointLight(0x4488ff,1.5,40); pl.position.set(0,8,6); scene.add(pl);
+
+const grid=new THREE.GridHelper(24,24,0x1a2a4a,0x0e1830); grid.position.y=-0.01; scene.add(grid);
+
+// nodes
+for(const p of Object.values(positions)){
+  const s=new THREE.Mesh(new THREE.SphereGeometry(0.18,20,20),
+    new THREE.MeshStandardMaterial({color:0x88ccff,emissive:0x3366aa,emissiveIntensity:1.4}));
+  s.position.copy(p); scene.add(s);
+}
+
+// wires
+const wires=new Map();
+for(const c of circuit.comps){
+  const A=positions[c.a], B=positions[c.b];
+  const dir=new THREE.Vector3().subVectors(B,A), len=dir.length();
+  const geo=new THREE.CylinderGeometry(0.07,0.07,len,14);
+  const mat=new THREE.MeshStandardMaterial({color:0x223355,emissive:0x4488cc,
+    emissiveIntensity:0.3,metalness:0.4,roughness:0.35});
+  const m=new THREE.Mesh(geo,mat);
+  m.position.copy(A).add(B).multiplyScalar(0.5);
+  m.quaternion.setFromUnitVectors(new THREE.Vector3(0,1,0),dir.clone().normalize());
+  scene.add(m); wires.set(c,m);
+}
+
+/* ════════════ PARTICULES ════════════ */
+class Flow{
+  constructor(a,b,cnt=16){
+    this.A=positions[a]; this.B=positions[b]; this.n=cnt;
+    this.t=Array.from({length:cnt},(_,i)=>i/cnt);
+    this.arr=new Float32Array(cnt*3);
+    this.geo=new THREE.BufferGeometry();
+    this.geo.setAttribute('position',new THREE.BufferAttribute(this.arr,3));
+    this.mat=new THREE.PointsMaterial({color:0xffdd44,size:0.16,transparent:true,
+      depthWrite:false,blending:THREE.AdditiveBlending});
+    this.pts=new THREE.Points(this.geo,this.mat); scene.add(this.pts);
+  }
+  update(I,dt){
+    const mag=Math.min(Math.abs(I)/0.5,1);
+    const spd=mag*3.0;
+    const dir=I>=0?1:-1;
+    for(let i=0;i<this.n;i++){
+      this.t[i]=((this.t[i]+dir*spd*dt)%1+1)%1;
+      const u=this.t[i];
+      this.arr[i*3]  =this.A.x+(this.B.x-this.A.x)*u;
+      this.arr[i*3+1]=this.A.y+(this.B.y-this.A.y)*u;
+      this.arr[i*3+2]=this.A.z+(this.B.z-this.A.z)*u;
+    }
+    this.geo.attributes.position.needsUpdate=true;
+    const hue=I>=0?0.12:0.55;
+    this.mat.color.setHSL(hue,1,0.4+0.4*mag);
+    this.mat.size=0.08+0.18*mag;
+  }
+}
+const flows=new Map();
+for(const c of circuit.comps) if(c.a!==c.b) flows.set(c,new Flow(c.a,c.b));
+
+/* ════════════ OSCILLOSCOPE ════════════ */
+const sc=document.getElementById('scope'), sctx=sc.getContext('2d');
+const W=sc.width, H=sc.height;
+const hist=[], MAX=420;
+
+function drawScope(V,cur){
+  const probe=circuit.comps.find(c=>c.type==='C');
+  hist.push({vs:V[1],vc:probe?V[3]:0,iC:probe?cur.get(probe):0});
+  if(hist.length>MAX) hist.shift();
+
+  sctx.clearRect(0,0,W,H);
+  sctx.strokeStyle='#15233a'; sctx.lineWidth=1;
+  sctx.beginPath(); sctx.moveTo(0,H/2); sctx.lineTo(W,H/2); sctx.stroke();
+  for(let x=0;x<W;x+=40){sctx.beginPath();sctx.moveTo(x,0);sctx.lineTo(x,H);sctx.stroke();}
+
+  const vS=H/16;
+  sctx.lineWidth=2;
+  // V source
+  sctx.strokeStyle='#ff6b6b'; sctx.beginPath();
+  hist.forEach((h,i)=>{const x=i/MAX*W, y=H/2-h.vs*vS;
+    i?sctx.lineTo(x,y):sctx.moveTo(x,y);}); sctx.stroke();
+  // V cap
+  sctx.strokeStyle='#4ab4ff'; sctx.beginPath();
+  hist.forEach((h,i)=>{const x=i/MAX*W, y=H/2-h.vc*vS;
+    i?sctx.lineTo(x,y):sctx.moveTo(x,y);}); sctx.stroke();
+
+  sctx.font='11px monospace';
+  sctx.fillStyle='#ff6b6b'; sctx.fillText('V source',10,18);
+  sctx.fillStyle='#4ab4ff'; sctx.fillText('V condensateur',10,32);
+}
+
+/* ════════════ ÉDITEUR ════════════ */
+const listEl=document.getElementById('list');
+const editEl=document.getElementById('edit');
+let selected=null;
+
+function renderList(){
+  listEl.innerHTML='';
+  circuit.comps.forEach((c,i)=>{
+    const row=document.createElement('div');
+    row.className='row'+(c===selected?' sel':'');
+    let label=c.name, info='';
+    if(c.type==='V'&&c.func) info=`${c.amp}V ${c.f}Hz`;
+    else if(c.type==='V'||c.type==='I') info=`${c.val}${c.type==='V'?'V':'A'}`;
+    else if(c.type==='D') info='diode';
+    else info=`${c.val}${c.type==='R'?'Ω':c.type==='C'?'F':'H'}`;
+    row.innerHTML=`<span><b>${label}</b> <small>n${c.a}–n${c.b}</small></span>
+                   <small>${info}</small>`;
+    row.onclick=()=>{selected=c; renderList(); renderEdit();};
+    listEl.appendChild(row);
+  });
+}
+
+function renderEdit(){
+  editEl.innerHTML='';
+  if(!selected) return;
+  const c=selected;
+  if(c.type==='D') {editEl.innerHTML='<p style="color:#7a8ea8;font-size:11px">Diode — non éditable (Is=1e-12, n=1.8)</p>'; return;}
+  if(c.type==='V'&&c.func){
+    editEl.innerHTML=`
+      <div class="param"><label>Amplitude <span class="v" id="vA">${c.amp}</span> V</label>
+        <input type="range" id="sA" min="1" max="12" step="0.1" value="${c.amp}"></div>
+      <div class="param"><label>Fréquence <span class="v" id="vF">${c.f}</span> Hz</label>
+        <input type="range" id="sF" min="10" max="500" step="10" value="${c.f}"></div>`;
+    editEl.querySelector('#sA').oninput=e=>{c.amp=+e.target.value;
+      document.getElementById('vA').textContent=c.amp;
+      c.func=t=>c.amp*Math.sin(2*Math.PI*c.f*t); renderList();};
+    editEl.querySelector('#sF').oninput=e=>{c.f=+e.target.value;
+      document.getElementById('vF').textContent=c.f;
+      c.func=t=>c.amp*Math.sin(2*Math.PI*c.f*t); renderList();};
+    return;
+  }
+  const ranges={
+    R:{min:1,max:1000,step:1,mult:1,unit:'Ω'},
+    C:{min:1e-6,max:1e-3,step:1e-6,mult:1,unit:'F'},
+    L:{min:1e-4,max:1,step:1e-4,mult:1,unit:'H'},
+    V:{min:0,max:12,step:0.1,mult:1,unit:'V'},
+    I:{min:0,max:2,step:0.01,mult:1,unit:'A'},
+  };
+  const r=ranges[c.type];
+  editEl.innerHTML=`
+    <div class="param"><label>Valeur <span class="v" id="vV">${c.val}</span> ${r.unit}</label>
+      <input type="range" id="sV" min="${r.min}" max="${r.max}" step="${r.step}" value="${c.val}"></div>`;
+  editEl.querySelector('#sV').oninput=e=>{c.val=+e.target.value;
+    document.getElementById('vV').textContent=c.val.toPrecision(4);
+    renderList();};
+}
+
+renderList();
+
+/* ════════════ UI ════════════ */
+const statusEl=document.getElementById('st');
+let running=true, tRender=0;
+
+document.getElementById('bPlay').onclick=e=>{
+  running=!running;
+  e.target.textContent=running?'⏸ Pause':'▶ Play';
+};
+document.getElementById('bReset').onclick=()=>{circuit.reset(); hist.length=0;};
+document.getElementById('bSave').onclick=()=>{
+  const data=circuit.comps.map(c=>({type:c.type,a:c.a,b:c.b,val:c.val,amp:c.amp,f:c.f}));
+  localStorage.setItem('circuitlab_v2',JSON.stringify({comps:data,nN:circuit.nN}));
+  statusEl.textContent='saved ✓';
+};
+document.getElementById('bLoad').onclick=()=>{
+  const raw=localStorage.getItem('circuitlab_v2');
+  if(!raw) return;
+  const d=JSON.parse(raw);
+  circuit.comps.length=0; circuit.nN=0; circuit.reset();
+  for(const c of d.comps){
+    const obj={...c,vP:0,iP:0,name:c.type};
+    if(c.type==='V'&&c.f) obj.func=t=>c.amp*Math.sin(2*Math.PI*c.f*t);
+    circuit.comps.push(obj);
+  }
+  circuit.nN=d.nN;
+  renderList();
+  statusEl.textContent='loaded ✓';
+};
+
+/* ════════════ ANIMATION ════════════ */
+const clock=new THREE.Clock();
+let prevV=null;
+
+function animate(){
+  requestAnimationFrame(animate);
+  const rdt=Math.min(clock.getDelta(),0.05);
+
+  if(running){
+    const steps=6;
+    for(let i=0;i<steps;i++){
+      const r=circuit.step();
+      if(i===steps-1) var last=r;
+    }
+    // flows
+    for(const [c,f] of flows) f.update(last.cur.get(c), rdt);
+    // wire glow
+    for(const c of circuit.comps){
+      const w=wires.get(c); if(!w) continue;
+      const I=last.cur.get(c);
+      w.material.emissiveIntensity=0.25+Math.min(Math.abs(I)/0.5,1)*2.2;
+    }
+    drawScope(last.V, last.cur);
+
+    const Vc=last.V[3], Ic=last.cur.get(circuit.comps[3]);
+    statusEl.innerHTML=
+      `V(C) = ${Vc.toFixed(2)} V<br>`+
+      `I(C) = ${(Ic*1000).toFixed(1)} mA<br>`+
+      `I(D) = ${(last.cur.get(circuit.comps[2])*1000).toFixed(1)} mA<br>`+
+      `dt = ${(circuit.dt*1e6).toFixed(1)} µs<br>`+
+      `t = ${(circuit.t*1000).toFixed(1)} ms`;
+  }
+  ctrl.update();
+  rnd.render(scene,cam);
+}
+animate();
+
+addEventListener('resize',()=>{
+  cam.aspect=innerWidth/innerHeight; cam.updateProjectionMatrix();
+  rnd.setSize(innerWidth,innerHeight);
+});
+</script>
+</body>
+</html>
